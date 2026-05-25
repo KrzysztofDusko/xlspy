@@ -245,31 +245,42 @@ class BiffReader:
         self.column_num = -1
 
         if record_id == self._row:
-            self.row_index = self._get_int32(buffer, 0)
+            if len(buffer) >= 4:
+                self.row_index = self._get_int32(buffer, 0)
+            else:
+                self.row_index = -1
+        elif len(buffer) < 8:
+            pass
         elif record_id in (self._blank, self._boolError, self._formulaError):
             self.read_cell = True
             self.cell_type = CellType.nullValue
         elif record_id == self._number:
-            self.double_val = self._get_rk_number(buffer, 8)
-            self.read_cell = True
-            self.cell_type = CellType.doubleVal
+            if len(buffer) >= 12:
+                self.double_val = self._get_rk_number(buffer, 8)
+                self.read_cell = True
+                self.cell_type = CellType.doubleVal
         elif record_id in (self._bool, self._formulaBool):
-            self.bool_value = (buffer[8] == 1)
-            self.read_cell = True
-            self.cell_type = CellType.boolVal
+            if len(buffer) >= 9:
+                self.bool_value = (buffer[8] == 1)
+                self.read_cell = True
+                self.cell_type = CellType.boolVal
         elif record_id in (self._formulaNumber, self._float):
-            self.double_val = self._get_double(buffer, 8)
-            self.read_cell = True
-            self.cell_type = CellType.doubleVal
+            if len(buffer) >= 16:
+                self.double_val = self._get_double(buffer, 8)
+                self.read_cell = True
+                self.cell_type = CellType.doubleVal
         elif record_id in (self._string, self._formulaString):
-            length = self._get_dword(buffer, 8)
-            self.string_value = self._get_string(buffer, 8 + 4, length)
-            self.read_cell = True
-            self.cell_type = CellType.stringVal
+            if len(buffer) >= 12:
+                length = self._get_dword(buffer, 8)
+                if len(buffer) >= 12 + 2 * length:
+                    self.string_value = self._get_string(buffer, 12, length)
+                    self.read_cell = True
+                    self.cell_type = CellType.stringVal
         elif record_id == self._sharedString:
-            self.int_value = self._get_dword(buffer, 8)
-            self.read_cell = True
-            self.cell_type = CellType.sharedString
+            if len(buffer) >= 12:
+                self.int_value = self._get_dword(buffer, 8)
+                self.read_cell = True
+                self.cell_type = CellType.sharedString
 
         if self.read_cell:
             self.column_num = self._get_dword(buffer, 0)
