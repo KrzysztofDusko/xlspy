@@ -129,11 +129,8 @@ class BiffReader:
 
     @staticmethod
     def _get_int32(buffer, offset):
-        result = buffer[offset + 3] << 24
-        result += buffer[offset + 2] << 16
-        result += buffer[offset + 1] << 8
-        result += buffer[offset]
-        return result
+        result = (buffer[offset + 3] << 24) + (buffer[offset + 2] << 16) + (buffer[offset + 1] << 8) + buffer[offset]
+        return result - 0x100000000 if result >= 0x80000000 else result
 
     @staticmethod
     def _get_word(buffer, offset):
