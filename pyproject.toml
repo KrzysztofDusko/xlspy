@@ -17,7 +17,7 @@ authors = [
 ]
 description = "Read and write XLSB and XLSX files efficiently."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -42,7 +42,7 @@ examples = [
 ]
 
 [tool.cibuildwheel]
-build = "cp311-* cp312-* cp313-* cp314-*"
+build = "cp312-* cp313-* cp314-*"
 archs = "auto64"
 
 [tool.pytest.ini_options]
