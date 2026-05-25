@@ -29,9 +29,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
-      - name: Install package (builds C extension automatically)
+      - name: Install package with test deps (builds C extension automatically)
         run: |
-          pip install -e .
+          pip install -e ".[test]"
 
       - name: Verify C extension is loaded
         run: |
@@ -39,7 +39,6 @@ jobs:
 
       - name: Run tests
         run: |
-          pip install pytest
           python -m pytest tests/ -v --tb=short
 
   test-fallback:
@@ -54,14 +53,13 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install package (without C extension)
+      - name: Install package with test deps (without C extension)
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install -e .
+          pip install -e ".[test]"
 
       - name: Run tests with C extension disabled
         run: |
-          pip install pytest
           XLSPY_DISABLE_C_EXT=1 python -m pytest tests/ -v --tb=short
 
       - name: Verify C extension is disabled
