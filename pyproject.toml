@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[[tool.setuptools.ext-modules]]
+name = "xlspy._c_core"
+sources = ["src/xlspy/c_ext/_c_core.c"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project]
+name = "xlspy"
+version = "0.1.0"
+authors = [
+  { name="Krzysztof Duśko"},
+]
+description = "Read and write XLSB and XLSX files efficiently."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Office Suites",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+]
+
+[project.urls]
+Repository = "https://github.com/KrzysztofDusko/xlspy/"
+
+[project.optional-dependencies]
+test = [
+    "pyodbc"
+]
+examples = [
+    "memory-profiler"
+]
+
+[tool.cibuildwheel]
+build = "cp311-* cp312-* cp313-* cp314-*"
+archs = "auto64"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+

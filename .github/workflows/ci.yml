@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install package (builds C extension automatically)
+        run: |
+          pip install -e .
+
+      - name: Verify C extension is loaded
+        run: |
+          python -c "from xlspy._accel import HAVE_C_EXT; print('C_EXT:', HAVE_C_EXT); assert HAVE_C_EXT, 'C extension not loaded!'"
+
+      - name: Run tests
+        run: |
+          pip install pytest
+          python -m pytest tests/ -v --tb=short
+
+  test-fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install package (without C extension)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .
+
+      - name: Run tests with C extension disabled
+        run: |
+          pip install pytest
+          XLSPY_DISABLE_C_EXT=1 python -m pytest tests/ -v --tb=short
+
+      - name: Verify C extension is disabled
+        run: |
+          XLSPY_DISABLE_C_EXT=1 python -c "from xlspy._accel import HAVE_C_EXT; print('C_EXT:', HAVE_C_EXT); assert not HAVE_C_EXT, 'C extension should be disabled!'"
