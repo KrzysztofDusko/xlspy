@@ -1,7 +1,9 @@
 import os
 import sys
 from typing import Generator
-import pyodbc
+
+import pytest
+pyodbc = pytest.importorskip("pyodbc")
 
 # Add src to path for local testing
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
