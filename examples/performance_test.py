@@ -2,7 +2,10 @@ import sys
 import os
 import time
 import xlsxwriter
-from memory_profiler import profile
+try:
+    from memory_profiler import profile
+except ImportError:
+    profile = None
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 from xlspy import XlsbWriter
 from xlspy import XlsxWriter

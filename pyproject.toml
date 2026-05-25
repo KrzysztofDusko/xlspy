@@ -34,7 +34,6 @@ Repository = "https://github.com/KrzysztofDusko/xlspy/"
 [project.optional-dependencies]
 test = [
     "nzpy-extended",
-    "pyodbc",
 ]
 examples = [
     "memory-profiler"

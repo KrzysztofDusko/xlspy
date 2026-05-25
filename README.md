@@ -88,63 +88,58 @@ with ExcelReader("large_file.xlsb") as reader:
         print(row)
 ```
 
-### Streaming from a Database (ODBC)
+### Streaming from a Database (Netezza)
 
-This example shows how to stream data directly from a database query into an XLSB file. This is highly memory-efficient as it doesn't load the entire dataset into memory.
+This example shows how to stream data directly from a database query into an XLSB file using `nzpy-extended`. This is highly memory-efficient as it doesn't load the entire dataset into memory.
 
-First, ensure you have `pyodbc` installed:
+First, ensure you have `nzpy-extended` installed:
 ```bash
-pip install pyodbc
+pip install nzpy-extended
 ```
 
 Then, you can use a generator function to feed data to `XlsbWriter`.
 
 ```python
 import os
-import pyodbc
 from typing import Generator
 from xlspy import XlsbWriter
 
 # --- Configuration ---
-# Make sure you have an ODBC driver and a configured DSN, or use a DSN-less connection string.
-DSN = "DRIVER={Your ODBC Driver};SERVER=your_server;DATABASE=your_db;UID=your_user;PWD=your_password"
+NZ_CONFIG = {
+    "host": os.environ.get("NZ_DEV_HOST", "your_host"),
+    "port": int(os.environ.get("NZ_DEV_PORT", "5480")),
+    "database": os.environ.get("NZ_DEV_DB", "your_db"),
+    "user": os.environ.get("NZ_DEV_USER", "your_user"),
+    "password": os.environ.get("NZ_DEV_PASSWORD", "your_password"),
+}
 QUERY = "SELECT * FROM YourTable"
 OUTPUT_FILENAME = "db_output.xlsb"
 
-def row_generator(cursor: pyodbc.Cursor) -> Generator[list[any], None, None]:
-    """
-    Generates rows from a pyodbc cursor, yielding headers first, followed by data rows.
-    """
-    # Extract column headers from cursor description
+
+def row_generator(cursor) -> Generator[list, None, None]:
+    """Yields column headers first, then each data row."""
     headers = [column[0] for column in cursor.description]
     yield headers
-
-    # Yield each row until the cursor is exhausted
     while row := cursor.fetchone():
         yield list(row)
 
+
 # --- Main Execution ---
 try:
-    # Connect to the database
-    with pyodbc.connect(DSN) as conn:
+    import nzpy_extended.sync as nzpy
+
+    with nzpy.connect(**NZ_CONFIG) as conn:
         cursor = conn.cursor()
         cursor.execute(QUERY)
 
-        # Use XlsbWriter to write the data stream
         with XlsbWriter(OUTPUT_FILENAME) as writer:
             writer.add_sheet("Database Export")
             writer.write_sheet(row_generator(cursor))
-            
-            # You can also add hidden sheets with metadata, like the query itself
             writer.add_sheet("SQL Query", hidden=True)
             writer.write_sheet([["SQL"], [QUERY]])
 
-
     print(f"Successfully created '{OUTPUT_FILENAME}'")
 
-except pyodbc.Error as ex:
-    sqlstate = ex.args[0]
-    print(f"Database connection or query execution error: {sqlstate}\n{ex}")
 except Exception as e:
     print(f"An unexpected error occurred: {e}")
 ```
@@ -159,24 +154,24 @@ All benchmarks: **50000 × 50** dataset (2.5M cells). Tests performed on **Windo
 
 | Library | Format | Time | Size |
 |---------|--------|------|------|
-| **xlspy (C_EXT)** | XLSB | **0.70 s** | 8.05 MB |
-| xlspy (Python) | XLSB | 1.61 s | 8.05 MB |
-| xlspy | XLSX | 2.07 s | 5.37 MB |
-| [xlsxwriter](https://pypi.org/project/xlsxwriter/) | XLSX | 9.00 s | 11.14 MB |
+| **xlspy (C_EXT)** | XLSB | **1.02 s** | 7.20 MB |
+| xlspy (Python) | XLSB | 2.54 s | 7.20 MB |
+| xlspy | XLSX | 3.66 s | 6.32 MB |
+| [xlsxwriter](https://pypi.org/project/xlsxwriter/) | XLSX | 8.67 s | 11.44 MB |
 
 ### Read
 
 | Library | Format | Time | Notes |
 |---------|--------|------|-------|
-| **xlspy (C_EXT)** | XLSB | **0.65 s** | default, compiled C |
-| xlspy | XLSX | 4.48 s | uses expat XML parser (C) |
-| xlspy (Python) | XLSB | 5.93 s | pure Python fallback |
-| [openpyxl](https://pypi.org/project/openpyxl/) | XLSX | 5.68 s | read-only mode |
+| **xlspy (C_EXT)** | XLSB | **1.39 s** | default, compiled C |
+| xlspy | XLSX | 4.72 s | uses expat XML parser (C) |
+| xlspy (Python) | XLSB | 6.41 s | pure Python fallback |
+| [openpyxl](https://pypi.org/project/openpyxl/) | XLSX | 7.85 s | read-only mode |
 
 
 ### Analysis
 
-The **8.96× read speedup** comes from two factors:
+The **4.6× read speedup** comes from two factors:
 - **~60–70%** — native C compilation, no interpreter overhead per record
 - **~30–40%** — algorithm simplification: flat array indexed by `col − first_col` instead of `Dict[int, Any]`, no `isinstance` per cell, no `BiffReader.read_worksheet()` method call per record
 
