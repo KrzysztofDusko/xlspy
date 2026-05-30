@@ -66,6 +66,62 @@ with XlsxWriter("output.xlsx", compressionLevel=6) as writer:
     writer.write_sheet([["This sheet is hidden."]])
 ```
 
+### Cell Formatting (Number, Date, DateTime)
+
+`xlspy` supports custom cell formatting for numbers, dates, and datetimes in both XLSB and XLSX output. Pass a `(value, format_string)` tuple to apply a format to a specific cell.
+
+```python
+from xlspy import XlsxWriter, F  # or XlsbWriter
+import datetime
+
+with XlsxWriter("formatted.xlsx") as writer:
+    writer.add_sheet("Formats")
+    writer.write_sheet([
+        ["Description", "Value"],
+        ["Thousands separator", (100000, F.THOUSANDS_SEP)],
+        ["Currency PLN",       (100000, F.CURRENCY_PLN)],
+        ["Currency EUR",       (100000, F.CURRENCY_EUR)],
+        ["Percentage",         (100000, F.PERCENTAGE)],
+        ["Scientific",         (100000, F.SCIENTIFIC)],
+        ["Two decimals",       (100000, F.TWO_DECIMALS)],
+        ["Text",               (100000, F.TEXT)],
+        ["Leading zeros",      (100000, F.LEADING_ZEROS)],
+        ["Short date",         (datetime.date(2026,6,1), F.DATE_SHORT)],
+        ["Long date",          (datetime.date(2026,6,1), F.DATE_LONG)],
+        ["ISO date",           (datetime.date(2026,6,1), F.DATE_ISO)],
+        ["Month + year",       (datetime.date(2026,6,1), F.DATE_MONTH_YEAR)],
+        ["Weekday + date",     (datetime.date(2026,6,1), F.DATE_WEEKDAY)],
+        ["Short datetime",     (datetime.datetime(2026,6,1,14,34), F.DATETIME_SHORT)],
+        ["Time only",          (datetime.datetime(2026,6,1,14,34), F.TIME_HH_MM)],
+        ["12h time",           (datetime.datetime(2026,6,1,14,34), F.TIME_12H)],
+        ["ISO datetime",       (datetime.datetime(2026,6,1,14,34), F.DATETIME_ISO)],
+    ])
+```
+
+#### Available Format Constants (`xlspy.F`)
+
+| Number | Date | DateTime |
+|--------|------|----------|
+| `F.THOUSANDS_SEP` — `#,##0` | `F.DATE_SHORT` — `dd.mm.yyyy` | `F.DATETIME_SHORT` — `dd.mm.yyyy hh:mm` |
+| `F.CURRENCY_PLN` — `#,##0.00 "zł"` | `F.DATE_LONG` — `d mmmm yyyy` | `F.DATETIME_LONG` — `d mmmm yyyy hh:mm:ss` |
+| `F.CURRENCY_EUR` — `#,##0.00 €` | `F.DATE_DAY_MONTH_YEAR` — `dd-mm-yyyy` | `F.TIME_HH_MM` — `hh:mm` |
+| `F.PERCENTAGE` — `0%` | `F.DATE_ISO` — `yyyy-mm-dd` | `F.TIME_HH_MM_SS` — `hh:mm:ss` |
+| `F.SCIENTIFIC` — `0.00E+00` | `F.DATE_MONTH_YEAR` — `mmmm yyyy` | `F.TIME_12H` — `h:mm AM/PM` |
+| `F.TWO_DECIMALS` — `#,##0.00` | `F.DATE_WEEKDAY` — `dddd, d mmmm yyyy` | `F.DATETIME_24H` — `dd.mm.yyyy hh:mm:ss` |
+| `F.TEXT` — `@` | `F.DATE_DAY_MONTH` — `d mmmm` | `F.DATETIME_ISO` — `yyyy-mm-dd"T"hh:mm:ss` |
+| `F.LEADING_ZEROS` — `000000000` | `F.DATE_YEAR_ONLY` — `yyyy` | `F.TIME_MS` — `hh:mm:ss.000` |
+
+You can also use custom format strings directly:
+
+```python
+writer.write_sheet([
+    ["Custom", (1234.56, '#,##0.00 "USD"')],
+    ["Date",   (datetime.date(2026,6,1), 'dd.mm.yyyy')],
+])
+```
+
+The formatting works transparently on both `XlsxWriter` and `XlsbWriter`.
+
 ### Reading XLSB and XLSX Files
 
 Reading files is done via the `ExcelReader` class, which automatically detects the format.
@@ -154,10 +210,10 @@ All benchmarks: **50000 × 50** dataset (2.5M cells). Tests performed on **Windo
 
 | Library | Format | Time | Size |
 |---------|--------|------|------|
-| **xlspy (C_EXT)** | XLSB | **1.02 s** | 7.20 MB |
-| xlspy (Python) | XLSB | 2.54 s | 7.20 MB |
-| xlspy | XLSX | 3.66 s | 6.32 MB |
-| [xlsxwriter](https://pypi.org/project/xlsxwriter/) | XLSX | 8.67 s | 11.44 MB |
+| **xlspy (C_EXT)** | XLSB | **1.02 s** | 7.25 MB |
+| xlspy (Python) | XLSB | 2.54 s | 7.25 MB |
+| xlspy | XLSX | 5.35 s | 6.34 MB |
+| [xlsxwriter](https://pypi.org/project/xlsxwriter/) | XLSX | 9.80 s | 11.57 MB |
 
 ### Read
 

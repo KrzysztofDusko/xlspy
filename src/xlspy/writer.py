@@ -7,6 +7,8 @@ from typing import  Tuple, Iterable
 import io
 import itertools
 from ._accel import encode_xlsb_row, calc_column_widths as accel_calc_column_widths
+from .formats import _is_formatted_cell, _unwrap_cell, _get_format
+
 
 @dataclass
 class FilterData:
@@ -19,13 +21,6 @@ class FilterData:
 
 class XlsbWriter:
     def __init__(self, filename: str, compressionLevel:int = 4):
-        """
-        Initializes an XlsbWriter object to create an .xlsb file.
-
-        Args:
-            filename (str): The path to the output .xlsb file.
-            compressionLevel (int): The compression level for the zip archive.
-        """
         self.filename = filename
         self._worksheet_data: list[Tuple[str, Iterable[list[any]],bool]] = []
         self._shared_strings: list[str] = []
@@ -38,54 +33,46 @@ class XlsbWriter:
         self._compressionLevel = compressionLevel
         self._zf: zipfile.ZipFile = None
 
+        self._format_registry: dict[str, int] = {}
+        self._format_xf_map: dict[str, int] = {}
+        self._next_numfmt_id = 167
+        self._next_xf_index = 4
+
     def __enter__(self):
-        """Enter the runtime context for the XlsbWriter."""
-        # Initialize the zip file if it's not already created
         if self._zf is None:
             self._zf = zipfile.ZipFile(self.filename, 'w', zipfile.ZIP_DEFLATED, compresslevel=self._compressionLevel)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """
-        Exit the runtime context for the XlsbWriter.
-        
-        Args:
-            exc_type: Exception type
-            exc_val: Exception value
-            exc_tb: Exception traceback
-            
-        Returns:
-            bool: False to propagate any exceptions, True to suppress them
-        """
         try:
             if self._zf is not None:
-                # Save the file content (you might want to add this logic)
                 self.save()
         finally:
-            # Always close the zip file
             if self._zf is not None:
                 self._zf.close()
                 self._zf = None
         
-        return False  # Don't suppress exceptions
+        return False
 
     def add_sheet(self, sheet_name: str, hidden : bool = False):
         self._sheet_count += 1
-        # Add a placeholder for the data iterable
         self._worksheet_data.append((sheet_name, iter([]),hidden))
 
-    def write_sheet(self, data: Iterable[list[any]]):
-        """
-        Adds a new worksheet to the workbook.
-        A subsequent call to write_sheet() is expected to provide the data.
+    def _register_format(self, fmt_string: str) -> int:
+        if fmt_string in self._format_xf_map:
+            return self._format_xf_map[fmt_string]
+        numfmt_id = self._next_numfmt_id
+        self._next_numfmt_id += 1
+        self._format_registry[fmt_string] = numfmt_id
+        xf_index = self._next_xf_index
+        self._next_xf_index += 1
+        self._format_xf_map[fmt_string] = xf_index
+        return xf_index
 
-        Args:
-            sheet_name (str): The name of the sheet.
-        """
+    def write_sheet(self, data: Iterable[list[any]]):
         if not self._worksheet_data:
             self.add_sheet("Sheet1")
         
-
         sheet_name,_, hidden = self._worksheet_data[self._sheet_count - 1]
         self._worksheet_data[self._sheet_count - 1] = (sheet_name, data, hidden)
 
@@ -97,23 +84,19 @@ class XlsbWriter:
         self._zf.writestr(f"xl/worksheets/binaryIndex{sheet_id}.bin", self._binaryIndexBin)
 
     def save(self):
-        """Save all content to the zip file."""
         if self._zf is None:
             raise RuntimeError("Zip file not initialized. Use context manager or initialize manually.")
             
         self._zf.writestr("[Content_Types].xml", self._create_content_types())
         self._zf.writestr("_rels/.rels", self._create_root_rels())
         self._zf.writestr("xl/workbook.bin", self._create_workbook_bin())
-        self._zf.writestr("xl/styles.bin", self._stylesBin)
+        self._zf.writestr("xl/styles.bin", self._build_styles_bin())
         self._zf.writestr("xl/_rels/workbook.bin.rels", self._create_workbook_rels())
 
-        # After all worksheets are processed, the shared strings table is complete.
-        # Now, write it to the zip file in a streaming fashion.
         with self._zf.open("xl/sharedStrings.bin", 'w') as sst_file:
             self._write_shared_strings_bin(sst_file)
         
     def close(self):
-        """Explicitly close the writer."""
         if self._zf is not None:
             self._zf.close()
             self._zf = None
@@ -239,46 +222,106 @@ class XlsbWriter:
         if buffer.tell() > 0:
             sst_file.write(buffer.getvalue())
 
-    def _write_cols_width(self, buffer: io.BytesIO, start_col: int, end_col: int, col_widths_array: list[float]):
-        """
-        Write column width information to the buffer.
-        
-        Args:
-            buffer (io.BytesIO): The buffer to write data into.
-            start_col (int): Starting column index (inclusive).
-            end_col (int): Ending column index (exclusive).
-            col_widths_array (list[float]): List of column widths in Excel units.
-            
-        Note:
-            Each column width is written with specific binary formatting that matches
-            the XLSB file format structure for column definitions.
-        """
-        # Write start marker for column width section
-        buffer.write(b'\x86\x03')  # Magic number indicating column width data
-        
-        # Process each column in the specified range
-        for i in range(start_col, end_col):
-            # Start of column definition block
-            buffer.write(b'\x00\x3C\x12')  # Fixed bytes for column definition header
-            
-            # Column min and max (both set to current column index)
-            buffer.write(struct.pack('<I', i))  # Little-endian 32-bit unsigned int
-            buffer.write(struct.pack('<I', i))  # Little-endian 32-bit unsigned int
-            
-            # Width information - write as single byte with pixel conversion
-            buffer.write(b'\x00')  # Reserved or padding byte
-            width_byte = struct.pack('<B', int(col_widths_array[i - start_col]))  # Convert to byte
-            buffer.write(width_byte)
-            buffer.write(b'\x00\x00')  # Additional padding
-            
-            # Placeholder for extended properties (usually zero-filled)
-            buffer.write(b'\x00\x00\x00\x00')
-            
-            # Column properties: normal, visible column
-            buffer.write(b'\x02')  # Normal column type
+    def _build_font_numfmt_record(self, ifmt: int, fmt_string: str) -> bytes:
+        cch = len(fmt_string)
+        remaining = 2 + 4 + cch * 2
+        buf = bytearray()
+        buf.append(0x2C)
+        buf.append(remaining)
+        buf.extend(struct.pack('<H', ifmt))
+        buf.extend(struct.pack('<I', cch))
+        buf.extend(fmt_string.encode('utf-16-le'))
+        return bytes(buf)
 
-        # Write end marker for column width section
-        buffer.write(b'\x00\x87\x03\x00')  # Magic number indicating end of column width data
+    def _build_style_record(self, ifmt: int, flags: int, byte6_extra: int = 0) -> bytes:
+        buf = bytearray()
+        buf.extend(b'\x2F\x10')
+        buf.extend(b'\x00\x00')
+        buf.extend(struct.pack('<H', ifmt))
+        buf.append(byte6_extra)
+        buf.extend(b'\x00\x00\x00\x00\x00')
+        buf.extend(b'\x00\x00')
+        buf.extend(b'\x10\x10')
+        buf.extend(struct.pack('<H', flags))
+        return bytes(buf)
+
+    def _build_styles_bin(self) -> bytes:
+        if not self._format_registry:
+            return self._stylesBin
+
+        buf = bytearray()
+
+        # BrtBeginStyleSheet
+        buf.extend(self._stylesBin[0:3])
+
+        # ── Fonts section (contains font/numfmt records) ──
+        total_records = 2 + len(self._format_registry)
+        buf.extend(b'\xE7\x04\x04')
+        buf.extend(struct.pack('<H', total_records))
+        buf.extend(b'\x00\x00')
+
+        # Font/numfmt record 1: ifmt=164, "yyyy\-mm\-dd\ hh:mm"
+        buf.extend(self._build_font_numfmt_record(164, 'yyyy\\-mm\\-dd\\ hh:mm'))
+        # Font/numfmt record 2: ifmt=166, "yyyy\-mm\-dd"
+        buf.extend(self._build_font_numfmt_record(166, 'yyyy\\-mm\\-dd'))
+
+        # Custom format records
+        for fmt_string, numfmt_id in self._format_registry.items():
+            buf.extend(self._build_font_numfmt_record(numfmt_id, fmt_string))
+
+        # BrtEndFonts
+        buf.extend(self._stylesBin[88:91])
+
+        # ── Static sections from default styles ──
+        # BrtBeginFills + 2 fills + borders + cellStyleXFs
+        buf.extend(self._stylesBin[91:409])
+
+        # ── CellXFs section (BrtBeginCellXFs + XF + BrtEndCellXFs) ──
+        buf.extend(self._stylesBin[409:437])
+
+        # ── NumFmts section (style records) ──
+        total_styles = 4 + len(self._format_registry)
+        buf.extend(b'\xE9\x04\x04')
+        buf.extend(struct.pack('<H', total_styles))
+        buf.extend(struct.pack('<H', 0))
+
+        # Style 0: default (fontId=0, ifmt=0)
+        buf.extend(self._build_style_record(0, 0x0000, 0x00))
+        # Style 1: date (fontId=0, ifmt=164)
+        buf.extend(self._build_style_record(164, 0x0001, 0x00))
+        # Style 2: datetime (fontId=0, ifmt=166)
+        buf.extend(self._build_style_record(166, 0x0001, 0x00))
+        # Style 3: bold header (fontId=1, ifmt=256, byte6=0x01)
+        buf.extend(self._build_style_record(256, 0x0000, 0x01))
+
+        # Custom format style records
+        for fmt_string, xf_index in sorted(self._format_xf_map.items(), key=lambda x: x[1]):
+            numfmt_id = self._format_registry[fmt_string]
+            buf.extend(self._build_style_record(numfmt_id, 0x0001, 0x00))
+
+        # BrtEndNumFmts
+        buf.extend(b'\xEA\x04\x00')
+
+        # ── Remaining sections (BrtBeginDXFs, tableStyles, BrtEndStyleSheet) ──
+        buf.extend(self._stylesBin[519:])
+
+        return bytes(buf)
+
+    def _write_cols_width(self, buffer: io.BytesIO, start_col: int, end_col: int, col_widths_array: list[float]):
+        buffer.write(b'\x86\x03')
+        
+        for i in range(start_col, end_col):
+            buffer.write(b'\x00\x3C\x12')
+            buffer.write(struct.pack('<I', i))
+            buffer.write(struct.pack('<I', i))
+            buffer.write(b'\x00')
+            width_byte = struct.pack('<B', int(col_widths_array[i - start_col]))
+            buffer.write(width_byte)
+            buffer.write(b'\x00\x00')
+            buffer.write(b'\x00\x00\x00\x00')
+            buffer.write(b'\x02')
+
+        buffer.write(b'\x00\x87\x03\x00')
 
     def _write_worksheet_bin(self, sheet_file: io.BufferedWriter, worksheet_data: Iterable[list[any]], worksheet_index:int):
         buffer = io.BytesIO()
@@ -295,27 +338,29 @@ class XlsbWriter:
 
         buffer.write(self._stickHeaderA1bytes)
 
-        # Calculate column information by reading first 100 rows for better width estimation
         data_iterator = iter(worksheet_data)
         rows_to_analyze = []
         max_cols = 1
-        
-        # Read up to 100 rows for analysis
+
         for _ in range(100):
             try:
                 row = next(data_iterator)
                 rows_to_analyze.append(row)
-                max_cols = max(max_cols, len(row) if row else 0)
+                row_len = 0
+                for c in row:
+                    cv = _unwrap_cell(c) if c is not None else None
+                    if cv is not None:
+                        row_len += 1
+                max_cols = max(max_cols, row_len if row else 0)
             except StopIteration:
-                break  # No more rows available
-            
+                break
+
         if max_cols == 0:
             max_cols = 1
-            
+
         start_col = 0
         end_col = max_cols
-        
-        # Create column widths based on analyzed rows content
+
         col_widths_array = accel_calc_column_widths(rows_to_analyze, max_cols)
         if col_widths_array is None:
             col_widths_array = []
@@ -323,7 +368,8 @@ class XlsbWriter:
                 max_width = 0
                 for row in rows_to_analyze:
                     if i < len(row):
-                        cell = row[i]
+                        cell = row[i] if i < len(row) else None
+                        cell = _unwrap_cell(cell) if cell is not None else None
                         if cell is not None:
                             if isinstance(cell, Decimal):
                                 cell = float(cell)
@@ -359,69 +405,94 @@ class XlsbWriter:
 
         row_idx = -1  
         for row_idx, row in enumerate(data_iterator):
-            c_result = encode_xlsb_row(
-                row, self._shared_strings_dict, self._shared_strings,
-                self._sst_unique_count, self._sst_all_count, row_idx
-            )
-            if c_result is not None:
-                cell_data, self._sst_unique_count, self._sst_all_count = c_result
-                buffer.write(cell_data)
-            else:
-                last_col = len(row) - 1 if row else 0
-                
-                buffer.write(b'\x00\x19')
-                buffer.write(struct.pack('<I', row_idx))
-                buffer.write(b'\x00\x00\x00\x00')
-                buffer.write(struct.pack('<I', 0x12c))
-                buffer.write(b'\x00\x01\x00\x00\x00')
-                buffer.write(struct.pack('<II', 0, last_col))
+            has_formatted = any(_is_formatted_cell(c) for c in row if c is not None)
 
-                for col_idx, cell in enumerate(row):
-                    if cell is None:
-                        continue
-                    if isinstance(cell, str):       
-                        self._write_str(buffer, cell, shared_strings_dict, shared_strings_append, row_idx, col_idx)
-                    elif isinstance(cell, bool):
-                        buffer.write(b'\x04\x09')
-                        buffer.write(struct.pack('<IIB', col_idx, 0, 1 if cell else 0))
-                    elif isinstance(cell, int):
-                        if -536870912 <= cell <= 536870911:
-                            rk_val = (cell << 2) | 0b10
-                            buffer.write(b'\x02\x0C')
-                            buffer.write(struct.pack('<IIi', col_idx, 0, rk_val))
-                        else:
-                            buffer.write(b'\x05\x10')
-                            buffer.write(struct.pack('<IId', col_idx, 0, float(cell)))
-                    elif isinstance(cell, (float, Decimal)): 
-                        buffer.write(b'\x05\x10')
-                        buffer.write(struct.pack('<IId', col_idx, 0, float(cell)))
-                    elif isinstance(cell, datetime.datetime):
-                        if cell.year < 1900 or cell.year > 9999:
-                            self._write_str(buffer, str(cell), shared_strings_dict, shared_strings_append, row_idx, col_idx)
-                        else:
-                            excel_date = (cell - datetime.datetime(1899, 12, 30, tzinfo=cell.tzinfo)).total_seconds() / 86400.0
-                            buffer.write(b'\x05\x10')
-                            buffer.write(struct.pack('<IId', col_idx, 1, excel_date))
-                    elif isinstance(cell, datetime.date):
-                        if cell.year < 1900 or cell.year > 9999:
-                            self._write_str(buffer, str(cell), shared_strings_dict, shared_strings_append, row_idx, col_idx)
-                        else:
-                            excel_date = (datetime.datetime.combine(cell, datetime.time()) - datetime.datetime(1899, 12, 30)).total_seconds() / 86400.0
-                            buffer.write(b'\x05\x10')
-                            buffer.write(struct.pack('<IId', col_idx, 2, excel_date))
+            if not has_formatted:
+                c_result = encode_xlsb_row(
+                    row, self._shared_strings_dict, self._shared_strings,
+                    self._sst_unique_count, self._sst_all_count, row_idx
+                )
+                if c_result is not None:
+                    cell_data, self._sst_unique_count, self._sst_all_count = c_result
+                    buffer.write(cell_data)
+                    if buffer.tell() > BUFFER_SIZE:
+                        sheet_file.write(buffer.getvalue())
+                        buffer.seek(0)
+                        buffer.truncate()
+                    continue
+
+            last_col = len(row) - 1 if row else 0
+
+            buffer.write(b'\x00\x19')
+            buffer.write(struct.pack('<I', row_idx))
+            buffer.write(b'\x00\x00\x00\x00')
+            buffer.write(struct.pack('<I', 0x12c))
+            buffer.write(b'\x00\x01\x00\x00\x00')
+            buffer.write(struct.pack('<II', 0, last_col))
+
+            for col_idx, cell in enumerate(row):
+                if cell is None:
+                    continue
+
+                fmt_string = _get_format(cell)
+                if fmt_string is not None:
+                    xf_index = self._register_format(fmt_string)
+                    cell = _unwrap_cell(cell)
+                    has_custom_fmt = True
+                else:
+                    has_custom_fmt = False
+                    xf_index = 0
+
+                if isinstance(cell, str):
+                    if has_custom_fmt:
+                        self._write_str(buffer, cell, shared_strings_dict, shared_strings_append, row_idx, col_idx, xf_index)
                     else:
+                        self._write_str(buffer, cell, shared_strings_dict, shared_strings_append, row_idx, col_idx)
+                elif isinstance(cell, bool):
+                    style_ref = xf_index if has_custom_fmt else 0
+                    buffer.write(b'\x04\x09')
+                    buffer.write(struct.pack('<IIB', col_idx, style_ref, 1 if cell else 0))
+                elif isinstance(cell, int):
+                    style_ref = xf_index if has_custom_fmt else 0
+                    if -536870912 <= cell <= 536870911:
+                        rk_val = (cell << 2) | 0b10
+                        buffer.write(b'\x02\x0C')
+                        buffer.write(struct.pack('<IIi', col_idx, style_ref, rk_val))
+                    else:
+                        buffer.write(b'\x05\x10')
+                        buffer.write(struct.pack('<IId', col_idx, style_ref, float(cell)))
+                elif isinstance(cell, (float, Decimal)):
+                    style_ref = xf_index if has_custom_fmt else 0
+                    buffer.write(b'\x05\x10')
+                    buffer.write(struct.pack('<IId', col_idx, style_ref, float(cell)))
+                elif isinstance(cell, datetime.datetime):
+                    if cell.year < 1900 or cell.year > 9999:
                         self._write_str(buffer, str(cell), shared_strings_dict, shared_strings_append, row_idx, col_idx)
-            
+                    else:
+                        excel_date = (cell - datetime.datetime(1899, 12, 30, tzinfo=cell.tzinfo)).total_seconds() / 86400.0
+                        style_ref = xf_index if has_custom_fmt else 1
+                        buffer.write(b'\x05\x10')
+                        buffer.write(struct.pack('<IId', col_idx, style_ref, excel_date))
+                elif isinstance(cell, datetime.date):
+                    if cell.year < 1900 or cell.year > 9999:
+                        self._write_str(buffer, str(cell), shared_strings_dict, shared_strings_append, row_idx, col_idx)
+                    else:
+                        excel_date = (datetime.datetime.combine(cell, datetime.time()) - datetime.datetime(1899, 12, 30)).total_seconds() / 86400.0
+                        style_ref = xf_index if has_custom_fmt else 2
+                        buffer.write(b'\x05\x10')
+                        buffer.write(struct.pack('<IId', col_idx, style_ref, excel_date))
+                else:
+                    self._write_str(buffer, str(cell), shared_strings_dict, shared_strings_append, row_idx, col_idx)
+
             if buffer.tell() > BUFFER_SIZE:
                 sheet_file.write(buffer.getvalue())
                 buffer.seek(0)
                 buffer.truncate()
-        
+
         buffer.write(self._sheet1Bytes[218:290])
 
         last_row_idx = row_idx if row_idx > -1 else 0 
 
-        # doAutofilter
         if last_row_idx > 0:   
             buffer.write(self._autoFilterStartBytes)
             buffer.write(struct.pack('<I', 0))
@@ -442,7 +513,7 @@ class XlsbWriter:
         if buffer.tell() > 0:
             sheet_file.write(buffer.getvalue())
 
-    def _write_str(self, buffer, cell, shared_strings_dict, shared_strings_append, row_idx, col_idx):
+    def _write_str(self, buffer, cell, shared_strings_dict, shared_strings_append, row_idx, col_idx, style_override=None):
         self._sst_all_count += 1
         if cell not in shared_strings_dict:
             string_index = self._sst_unique_count
@@ -451,21 +522,22 @@ class XlsbWriter:
             self._sst_unique_count += 1
         else:
             string_index = shared_strings_dict[cell]
-        style_ref = 3 if row_idx == 0 else 0
+        if style_override is not None:
+            style_ref = style_override
+        else:
+            style_ref = 3 if row_idx == 0 else 0
         buffer.write(b'\x07\x0C')
         buffer.write(struct.pack('<III', col_idx, style_ref, string_index))
 
     def _write_filter_defined_names(self, sw: bytearray) -> None:
         filtered_dict_items_cnt = len(self._filtered_data_list) if self._filtered_data_list else 0
         
-        # Temporary fix for https://github.com/KrzysztofDusko/SpreadSheetTasks/issues/2
         if (filtered_dict_items_cnt > 0 and 
             (0x80 + (filtered_dict_items_cnt - 21) * 0x0c) <= 255):
             
             sw.extend(self._magicFilterExcel2016Fix0)
             
             if filtered_dict_items_cnt <= 10:
-                # !!! ? for cnt <=10
                 sw.extend(bytes([0x10 + (filtered_dict_items_cnt - 1) * 0x0c, 
                                filtered_dict_items_cnt]))
                 sw.extend(bytes([0x00, 0x00, 0x00]))
@@ -476,13 +548,12 @@ class XlsbWriter:
                                filtered_dict_items_cnt]))
                 sw.extend(bytes([0x00, 0x00, 0x00]))
                 
-            else:  # ???
+            else:
                 sw.extend(bytes([0x80 + (filtered_dict_items_cnt - 21) * 0x0c,
                                (filtered_dict_items_cnt - 1) // 10,
                                filtered_dict_items_cnt]))
                 sw.extend(bytes([0x00, 0x00, 0x00]))
             
-            # Write filter items
             for nm in range(filtered_dict_items_cnt):
                 sw.extend(bytes([0x00, 0x00, 0x00, 0x00]))
                 sw.extend(bytes([self._filtered_data_list[nm].sheet_index, 0x00, 0x00, 0x00]))
@@ -490,7 +561,6 @@ class XlsbWriter:
             
             sw.extend(bytes([0xE2, 0x02, 0x00]))
             
-            # Write sheet data
             for sheet_num in range(len(self._filtered_data_list)):
                 start_column = self._filtered_data_list[sheet_num].start_column
                 end_column = self._filtered_data_list[sheet_num].end_column
@@ -498,18 +568,15 @@ class XlsbWriter:
                 end_row = self._filtered_data_list[sheet_num].end_row
                 sheet_index = self._filtered_data_list[sheet_num].sheet_index
                 
-                # Modify magic bytes
                 magic_filter_fix = self._magicFilterExcel2016Fix1.copy()
                 magic_filter_fix[7] = sheet_index
                 magic_filter_fix[-2] = sheet_num
                 sw.extend(magic_filter_fix)
 
-
-                # Write binary data using struct.pack for proper byte conversion
-                sw.extend(struct.pack('<I', start_row))  # Int32 little-endian
-                sw.extend(struct.pack('<I', end_row))    # Int32 little-endian
-                sw.extend(struct.pack('<H', start_column))  # Int16 little-endian
-                sw.extend(struct.pack('<H', end_column))    # Int16 little-endian
+                sw.extend(struct.pack('<I', start_row))
+                sw.extend(struct.pack('<I', end_row))
+                sw.extend(struct.pack('<H', start_column))
+                sw.extend(struct.pack('<H', end_column))
                 
                 sw.extend(self._magicFilterExcel2016Fix2)
 
@@ -641,7 +708,7 @@ class XlsbWriter:
             0x00,
             0x00,
             0x00,
-            255,# -> (byte)sheetIndex,
+            255,
             0x00,
             0x00,
             0x00,
@@ -650,7 +717,7 @@ class XlsbWriter:
             0x00,
             0x00,
             0x5F,
-            0x00,   # _0, // FilterDatabase (UTF16) - starts
+            0x00,
             0x46,
             0x00,
             0x69,
@@ -678,13 +745,13 @@ class XlsbWriter:
             0x73,
             0x00,
             0x65,
-            0x00,# FilterDatabase (UTF16) - ends
+            0x00,
             0x0F,
             0x00,
             0x00,
             0x00,
             0x3B,
-            255,#->(byte)sheetNum,
+            255,
             0x00
         ])
     _magicFilterExcel2016Fix2 = bytes([0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF])
