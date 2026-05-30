@@ -493,21 +493,21 @@ class XlsbWriter:
 
         last_row_idx = row_idx if row_idx > -1 else 0 
 
-        if last_row_idx > 0:   
+        if row_idx >= 0:
             buffer.write(self._autoFilterStartBytes)
             buffer.write(struct.pack('<I', 0))
-        buffer.write(struct.pack('<I', last_row_idx))
-        buffer.write(struct.pack('<I', 0))
-        buffer.write(struct.pack('<I', 0 + end_col - 1))
-        buffer.write(self._autoFilterEndBytes)
-        self._filtered_data_list.append(
-            FilterData(
-            sheet_index=worksheet_index,
-            start_column=0,
-            end_column=end_col - 1,
-            start_row=0,
-            end_row=last_row_idx
-        ))
+            buffer.write(struct.pack('<I', last_row_idx))
+            buffer.write(struct.pack('<I', 0))
+            buffer.write(struct.pack('<I', 0 + end_col - 1))
+            buffer.write(self._autoFilterEndBytes)
+            self._filtered_data_list.append(
+                FilterData(
+                sheet_index=worksheet_index,
+                start_column=0,
+                end_column=end_col - 1,
+                start_row=0,
+                end_row=last_row_idx
+            ))
 
         buffer.write(self._sheet1Bytes[290:])
         if buffer.tell() > 0:
