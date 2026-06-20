@@ -1,6 +1,8 @@
+import io
 import os
 import sys
 import tempfile
+import zipfile
 import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
@@ -229,6 +231,84 @@ def test_read_complex_xlsx_values():
             print(f"  Complex XLSX values OK!")
     finally:
         os.remove(tmpfile)
+
+
+def test_xlsx_writer_with_bytesio():
+    """Write XLSX to BytesIO, then read back with ExcelReader from file."""
+    buf = io.BytesIO()
+    data = [['Name', 'Value'], ['foo', 42]]
+    with XlsxWriter(buf) as writer:
+        writer.add_sheet("Sheet1")
+        writer.write_sheet(data)
+
+    tmpfile = tempfile.mktemp(suffix='.xlsx')
+    try:
+        with open(tmpfile, 'wb') as f:
+            f.write(buf.getvalue())
+        with ExcelReader(tmpfile) as reader:
+            names = reader.get_sheet_names()
+            assert 'Sheet1' in names, f"XLSX BytesIO: sheets={names}"
+            rows = reader.read_all('Sheet1')
+            assert rows == [['Name', 'Value'], ['foo', 42]]
+    finally:
+        os.remove(tmpfile)
+
+
+def test_xlsb_writer_with_bytesio():
+    """Write XLSB to BytesIO, then read back with ExcelReader from file."""
+    buf = io.BytesIO()
+    data = [['Name', 'Value'], ['foo', 42]]
+    with XlsbWriter(buf) as writer:
+        writer.add_sheet("Sheet1")
+        writer.write_sheet(data)
+
+    tmpfile = tempfile.mktemp(suffix='.xlsb')
+    try:
+        with open(tmpfile, 'wb') as f:
+            f.write(buf.getvalue())
+        with ExcelReader(tmpfile) as reader:
+            names = reader.get_sheet_names()
+            assert 'Sheet1' in names, f"XLSB BytesIO: sheets={names}"
+            rows = reader.read_all('Sheet1')
+            assert rows == [['Name', 'Value'], ['foo', 42]]
+    finally:
+        os.remove(tmpfile)
+
+
+def test_writer_bytesio_valid_zip():
+    """Verify BytesIO output is a valid ZIP for both writers."""
+    data = [['A', 'B'], [1, 2]]
+
+    for suffix, writer_cls in [('.xlsx', XlsxWriter), ('.xlsb', XlsbWriter)]:
+        buf = io.BytesIO()
+        with writer_cls(buf) as writer:
+            writer.add_sheet("Data")
+            writer.write_sheet(data)
+
+        buf.seek(0)
+        with zipfile.ZipFile(buf) as zf:
+            assert len(zf.namelist()) > 0, f"{suffix}: empty zip"
+
+
+def test_sheet_names_roundtrip_xlsx_and_xlsb():
+    """Create XLSX and XLSB with two sheets, verify get_sheet_names() matches."""
+    sheet_names = ["FirstSheet", "SecondSheet"]
+    data = [["A", "B"], [1, 2]]
+
+    for suffix, writer_cls in [('.xlsx', XlsxWriter), ('.xlsb', XlsbWriter)]:
+        tmpfile = tempfile.mktemp(suffix=suffix)
+        try:
+            with writer_cls(tmpfile) as writer:
+                for name in sheet_names:
+                    writer.add_sheet(name)
+                    writer.write_sheet(data)
+
+            with ExcelReader(tmpfile) as reader:
+                names = reader.get_sheet_names()
+                assert names == sheet_names, \
+                    f"{suffix}: expected {sheet_names}, got {names}"
+        finally:
+            os.remove(tmpfile)
 
 
 def test_reader_with_path_in_constructor():

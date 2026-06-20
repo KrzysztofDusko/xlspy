@@ -19,8 +19,8 @@ class FilterData:
 
 
 class XlsxWriter:
-    def __init__(self, filename: str, compressionLevel: int = 4, useSharedStrings: bool = True):
-        self.filename = filename
+    def __init__(self, file: str | io.IOBase, compressionLevel: int = 4, useSharedStrings: bool = True):
+        self._file = file
         self._worksheet_data: list[Tuple[str, Iterable[list[any]], bool]] = []
         self._shared_strings: list[str] = []
         self._shared_strings_dict: dict[str, int] = {}
@@ -41,7 +41,7 @@ class XlsxWriter:
 
     def __enter__(self):
         if self._zf is None:
-            self._zf = zipfile.ZipFile(self.filename, 'w', zipfile.ZIP_DEFLATED, compresslevel=self._compressionLevel)
+            self._zf = zipfile.ZipFile(self._file, 'w', zipfile.ZIP_DEFLATED, compresslevel=self._compressionLevel)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
