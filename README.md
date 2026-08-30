@@ -122,6 +122,50 @@ writer.write_sheet([
 
 The formatting works transparently on both `XlsxWriter` and `XlsbWriter`.
 
+### Updating an Existing Workbook
+
+`XlsxUpdater` and `XlsbUpdater` replace the data region of an existing workbook
+while keeping the workbook structure, styles, drawings and unrelated sheets.
+They are useful when a workbook contains pivot tables: the worksheet source
+range and pivot-cache refresh metadata are updated together.
+
+```python
+from xlspy import XlsxUpdater, XlsbUpdater
+
+rows = [
+    ["Alice", 42],
+    ["Bob", 37],
+]
+
+updater = XlsxUpdater("template.xlsx")
+print(updater.get_sheet_names())
+updater.replace_sheet_data("Data", rows, headers=["Name", "Amount"])
+updater.save("result.xlsx")       # use save() to replace the input atomically
+
+# The XLSB API is identical:
+binary_updater = XlsbUpdater("template.xlsb")
+binary_updater.replace_sheet_data("Data", rows, headers=["Name", "Amount"])
+binary_updater.save("result.xlsb")
+```
+
+Rows may be any iterable, including a generator. Only trailing rows consisting
+entirely of `None` are removed; blank rows in the middle are preserved. By
+default, the updater inherits the dominant style of each existing column. Use
+`style_fallback="general"` to write new cells with the General style. Existing
+writer-style `(value, format_string)` tuples are accepted for compatibility,
+but updating a workbook does not create new styles.
+
+When a pivot cache is present, keep the source column schema (column order and
+count) unchanged; changing the schema requires rebuilding the pivot cache and
+is outside the updater's scope.
+
+On Windows, the generated workbook can be checked with the installed Excel
+COM server (the script opens files read-only using Excel's normal loader):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\validate_excel_com.ps1 result.xlsx result.xlsb
+```
+
 ### Reading XLSB and XLSX Files
 
 Reading files is done via the `ExcelReader` class, which automatically detects the format.
