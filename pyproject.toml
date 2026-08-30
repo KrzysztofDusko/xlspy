@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/KrzysztofDusko/xlspy/"
+Repository = "https://github.com/justybase/xlspy/"
 
 [project.optional-dependencies]
 test = [
