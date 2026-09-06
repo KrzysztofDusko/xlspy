@@ -14,12 +14,16 @@ from .biff_utils import (
     Biff12Record,
     build_record,
     iter_records,
+    iter_records_stream,
     parse_shared_strings_bin,
     read_utf16,
 )
 from .updater_utils import (
+    DiskStringIndex,
     ZipPackage,
     column_index_to_letter,
+    copy_file_range,
+    copy_stream,
     local_xml_name,
     materialize_rows,
     parse_relationships_xml,
@@ -71,6 +75,7 @@ class XlsbUpdater:
         self._shared_strings_total = 0
         self._shared_strings_pending: list[str] = []
         self._shared_strings_dirty = False
+        self._stream_shared_strings: DiskStringIndex | None = None
 
     def get_sheet_names(self) -> list[str]:
         """Return worksheet names in workbook order."""
@@ -93,6 +98,15 @@ class XlsbUpdater:
             sheet_path = self._sheets[sheet_name]
         except KeyError as exc:
             raise KeyError(f"Worksheet not found: {sheet_name}") from exc
+
+        if self._stream_shared_strings is not None:
+            self.replace_sheet_data_stream(
+                sheet_name,
+                rows,
+                headers=headers,
+                style_fallback=style_fallback,
+            )
+            return
 
         materialized = trim_trailing_empty_rows(materialize_rows(rows))
         header_values = list(headers) if headers is not None else None
@@ -148,6 +162,186 @@ class XlsbUpdater:
         self._package.set(sheet_path, bytes(updated))
         self._commit_shared_strings()
         self._patch_pivot_caches(sheet_name, last_row, last_col)
+
+    def replace_sheet_data_stream(
+        self,
+        sheet_name: str,
+        rows: Iterable[Sequence[Any]],
+        *,
+        headers: Sequence[str] | None = None,
+        style_fallback: StyleFallback = "inherit",
+    ) -> None:
+        """Replace worksheet data atomically while streaming rows.
+
+        The package and disk-backed shared-string index are committed only
+        after the one-pass row source and all metadata updates succeed.  A
+        failure therefore leaves this updater reusable for a later attempt.
+        """
+
+        if style_fallback not in ("inherit", "general"):
+            raise ValueError("style_fallback must be 'inherit' or 'general'")
+        if sheet_name not in self._sheets:
+            raise KeyError(f"Worksheet not found: {sheet_name}")
+
+        self._ensure_stream_shared_strings()
+        store = self._stream_shared_strings
+        self._package.begin_transaction()
+        try:
+            if store is not None:
+                store.begin_transaction()
+            self._replace_sheet_data_stream_impl(
+                sheet_name,
+                rows,
+                headers=headers,
+                style_fallback=style_fallback,
+            )
+            self._package.commit_transaction()
+            if store is not None:
+                store.commit_transaction()
+        except BaseException:
+            if store is not None:
+                store.rollback_transaction()
+            self._package.rollback_transaction()
+            raise
+
+    def _replace_sheet_data_stream_impl(
+        self,
+        sheet_name: str,
+        rows: Iterable[Sequence[Any]],
+        *,
+        headers: Sequence[str] | None = None,
+        style_fallback: StyleFallback = "inherit",
+    ) -> None:
+        """Replace worksheet data while streaming rows through temporary files."""
+
+        if style_fallback not in ("inherit", "general"):
+            raise ValueError("style_fallback must be 'inherit' or 'general'")
+        try:
+            sheet_path = self._sheets[sheet_name]
+        except KeyError as exc:
+            raise KeyError(f"Worksheet not found: {sheet_name}") from exc
+
+        header_values = list(headers) if headers is not None else None
+        original_sheet = self._package.temporary_path(suffix=".bin")
+        with self._package.open_entry(sheet_path) as source, original_sheet.open("wb") as target:
+            copy_stream(source, target)
+
+        self._ensure_stream_shared_strings()
+        header_styles, data_styles = self._collect_styles_stream(
+            original_sheet, headers_provided=headers is not None
+        )
+        if self._stream_shared_strings is not None:
+            self._shared_strings_total = max(
+                0,
+                self._stream_shared_strings.total_count
+                - self._shared_string_ref_count_stream(original_sheet),
+            )
+            self._stream_shared_strings.total_count = self._shared_strings_total
+            self._stream_shared_strings.dirty = True
+        date_xf = self._find_date_xf() if style_fallback == "inherit" else None
+
+        rows_file = self._package.temporary_path(suffix=".rows")
+        width = len(header_values) if header_values is not None else 0
+        data_rows_seen = 0
+        kept_data_rows = 0
+        last_kept_end = 0
+        pending_empty_width = 0
+
+        try:
+            with rows_file.open("wb") as output:
+                next_row = 0
+
+                def write_row(row_number: int, row_cells: list[bytes]) -> None:
+                    payload = bytearray(25)
+                    struct.pack_into("<i", payload, 0, row_number)
+                    struct.pack_into("<i", payload, 8, 300)
+                    payload[13] = 1
+                    struct.pack_into("<i", payload, 17, 0)
+                    # The final column is not known until the generator ends.
+                    struct.pack_into("<i", payload, 21, 0)
+                    output.write(build_record(0x00, bytes(payload)))
+                    for cell in row_cells:
+                        output.write(cell)
+
+                if header_values is not None:
+                    header_texts = [
+                        "" if unwrap_cell(value) is None else str(unwrap_cell(value))
+                        for value in header_values
+                    ]
+                    write_row(
+                        next_row,
+                        [
+                            self._string_cell_bytes(
+                                column,
+                                0 if style_fallback == "general" else header_styles.get(column, 0),
+                                header_text,
+                            )
+                            for column, header_text in enumerate(header_texts)
+                        ],
+                    )
+                    last_kept_end = output.tell()
+                    next_row += 1
+
+                for source_row in rows:
+                    if isinstance(source_row, (str, bytes, bytearray)):
+                        raise TypeError("Each row must be a sequence of cells, not text")
+                    try:
+                        row = list(source_row)
+                    except TypeError as exc:
+                        raise TypeError("Each row must be an iterable of cells") from exc
+
+                    cells = [
+                        self._value_cell_bytes(
+                            raw,
+                            column,
+                            data_styles,
+                            date_xf,
+                            style_fallback,
+                        )
+                        for column, raw in enumerate(row)
+                        if raw is not None
+                    ]
+                    write_row(next_row, cells)
+                    data_rows_seen += 1
+                    next_row += 1
+
+                    if all(cell is None for cell in row):
+                        pending_empty_width = max(pending_empty_width, len(row))
+                    else:
+                        width = max(width, pending_empty_width, len(row))
+                        pending_empty_width = 0
+                        kept_data_rows = data_rows_seen
+                        last_kept_end = output.tell()
+
+                output.truncate(last_kept_end)
+
+            last_col = max(0, width - 1)
+            self._patch_row_headers_file(rows_file, last_col)
+            region = self._find_rows_region_stream(original_sheet)
+            updated_sheet = self._package.temporary_path(suffix=".bin")
+            with updated_sheet.open("wb") as output:
+                copy_file_range(original_sheet, output, 0, region.rows_start)
+                with rows_file.open("rb") as generated_rows:
+                    copy_stream(generated_rows, output)
+                copy_file_range(
+                    original_sheet,
+                    output,
+                    region.rows_end,
+                    original_sheet.stat().st_size,
+                )
+
+            total_rows = kept_data_rows + (1 if header_values is not None else 0)
+            last_row = max(0, total_rows - 1)
+            self._patch_sheet_file(updated_sheet, last_row, last_col)
+            self._package.set_file(sheet_path, updated_sheet)
+            self._commit_stream_shared_strings()
+            self._patch_pivot_caches(sheet_name, last_row, last_col)
+        finally:
+            for temporary_path in (original_sheet, rows_file):
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def save(self, output_path: str | os.PathLike[str] | None = None) -> None:
         """Save to a new path or atomically replace the input file."""
@@ -220,6 +414,142 @@ class XlsbUpdater:
         }
         self._shared_strings_total = parsed.total_count
 
+    def _ensure_stream_shared_strings(self) -> None:
+        if self._stream_shared_strings is not None:
+            return
+        if not self._package.has("xl/sharedStrings.bin"):
+            return
+
+        store = DiskStringIndex(self._package.temporary_directory)
+        total_count: int | None = None
+        value_count = 0
+        with self._package.open_entry("xl/sharedStrings.bin") as source:
+            for record, payload in iter_records_stream(source):
+                if record.record_id == 0x9F:
+                    if len(payload) < 8:
+                        raise ValueError("Malformed XLSB shared-string header")
+                    total_count = struct.unpack_from("<I", payload, 0)[0]
+                elif record.record_id == 0x13:
+                    if len(payload) < 5:
+                        raise ValueError("Malformed XLSB shared-string item")
+                    character_count = struct.unpack_from("<I", payload, 1)[0]
+                    value, string_end = read_utf16(payload, 5, character_count)
+                    if string_end > len(payload):
+                        raise ValueError("Malformed XLSB shared-string item length")
+                    store.add_existing(value, value_count)
+                    value_count += 1
+
+        store.total_count = total_count if total_count is not None else value_count
+        self._stream_shared_strings = store
+
+    def _commit_stream_shared_strings(self) -> None:
+        store = self._stream_shared_strings
+        if store is None or not store.dirty:
+            return
+
+        source_path = self._package.temporary_path(suffix=".bin")
+        with self._package.open_entry("xl/sharedStrings.bin") as source, source_path.open("wb") as target:
+            copy_stream(source, target)
+        output_path = self._package.temporary_path(suffix=".bin")
+        inserted = False
+        output_staged = False
+        try:
+            with source_path.open("rb") as source, output_path.open("wb") as target:
+                for record, payload in iter_records_stream(source):
+                    if record.record_id == 0xA0 and not inserted:
+                        for value in store.pending_values():
+                            encoded = value.encode("utf-16le")
+                            target.write(
+                                build_record(
+                                    0x13,
+                                    b"\x00" + struct.pack("<I", len(encoded) // 2) + encoded,
+                                )
+                            )
+                        inserted = True
+
+                    if record.record_id == 0x9F and len(payload) >= 8:
+                        header_length = record.data_start - record.header_start
+                        source.seek(record.header_start)
+                        target.write(source.read(header_length))
+                        updated_payload = bytearray(payload)
+                        struct.pack_into(
+                            "<II",
+                            updated_payload,
+                            0,
+                            store.total_count,
+                            store.unique_count,
+                        )
+                        target.write(updated_payload)
+                        source.seek(record.data_end)
+                    else:
+                        copy_file_range(
+                            source_path,
+                            target,
+                            record.header_start,
+                            record.data_end,
+                        )
+
+                if not inserted:
+                    for value in store.pending_values():
+                        encoded = value.encode("utf-16le")
+                        target.write(
+                            build_record(
+                                0x13,
+                                b"\x00" + struct.pack("<I", len(encoded) // 2) + encoded,
+                            )
+                        )
+            self._package.set_file("xl/sharedStrings.bin", output_path)
+            output_staged = True
+            store.clear_pending()
+        finally:
+            try:
+                source_path.unlink()
+            except FileNotFoundError:
+                pass
+            if not output_staged:
+                try:
+                    output_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _collect_styles_stream(
+        self, sheet_path: str | os.PathLike[str], *, headers_provided: bool
+    ) -> tuple[dict[int, int], dict[int, int]]:
+        header_styles: dict[int, int] = {}
+        data_counts: dict[int, dict[int, int]] = {}
+        row = -1
+        with open(sheet_path, "rb") as stream:
+            for record, payload in iter_records_stream(stream):
+                if record.record_id == 0x00 and record.length >= 4:
+                    row = struct.unpack_from("<i", payload, 0)[0]
+                    continue
+                if record.record_id not in _CELL_RECORDS or record.length < 8:
+                    continue
+                column, style = struct.unpack_from("<II", payload, 0)
+                style &= 0xFFFFFF
+                if style <= 0:
+                    continue
+                if headers_provided and row == 0:
+                    header_styles.setdefault(column, style)
+                elif row >= 0:
+                    counts = data_counts.setdefault(column, {})
+                    counts[style] = counts.get(style, 0) + 1
+
+        data_styles = {
+            column: max(counts.items(), key=lambda item: (item[1], -item[0]))[0]
+            for column, counts in data_counts.items()
+        }
+        return header_styles, data_styles
+
+    @staticmethod
+    def _shared_string_ref_count_stream(sheet_path: str | os.PathLike[str]) -> int:
+        with open(sheet_path, "rb") as stream:
+            return sum(
+                1
+                for record, _ in iter_records_stream(stream)
+                if record.record_id == 0x07
+            )
+
     def _commit_shared_strings(self) -> None:
         if self._shared_strings_data is None or (
             not self._shared_strings_pending and not self._shared_strings_dirty
@@ -250,6 +580,8 @@ class XlsbUpdater:
         self._package.set("xl/sharedStrings.bin", self._shared_strings_data)
 
     def _shared_string_index(self, value: str) -> int:
+        if self._stream_shared_strings is not None:
+            return self._stream_shared_strings.get_or_add(value)
         index = self._shared_string_indices.get(value)
         if index is None:
             index = len(self._shared_strings_values)
@@ -427,12 +759,72 @@ class XlsbUpdater:
 
     def _string_cell_bytes(self, column: int, style: int, text: str) -> bytes:
         text = strip_invalid_xml_characters(text)
-        if self._shared_strings_data is None:
+        if self._shared_strings_data is None and self._stream_shared_strings is None:
             encoded = text.encode("utf-16le")
             payload = struct.pack("<III", column, style, len(encoded) // 2) + encoded
             return build_record(0x06, payload)
         index = self._shared_string_index(text)
         return build_record(0x07, struct.pack("<III", column, style, index))
+
+    @staticmethod
+    def _patch_row_headers_file(path: str | os.PathLike[str], last_col: int) -> None:
+        with open(path, "r+b") as stream:
+            for record, _ in iter_records_stream(stream):
+                if record.record_id == 0x00 and record.length >= 25:
+                    stream.seek(record.data_start + 21)
+                    stream.write(struct.pack("<i", last_col))
+                    stream.seek(record.data_end)
+
+    @staticmethod
+    def _find_rows_region_stream(sheet_path: str | os.PathLike[str]) -> "_RowsRegion":
+        rows_start = -1
+        last_cell_end = -1
+        last_row_header_end = -1
+        last_wrapper = -1
+        with open(sheet_path, "rb") as stream:
+            for record, _ in iter_records_stream(stream):
+                if record.record_id == 0x00:
+                    if rows_start == -1:
+                        rows_start = record.header_start
+                    last_row_header_end = record.data_end
+                elif 0x01 <= record.record_id <= 0x0B:
+                    last_cell_end = record.data_end
+                elif record.record_id == 0x25 and record.length == 6:
+                    last_wrapper = record.header_start
+
+        if rows_start == -1:
+            size = os.path.getsize(sheet_path)
+            insert_at = last_wrapper if last_wrapper >= 0 else size
+            return _RowsRegion(insert_at, insert_at, [])
+        rows_end = max(last_cell_end, last_row_header_end)
+        if rows_end < 0:
+            rows_end = last_wrapper if last_wrapper >= 0 else os.path.getsize(sheet_path)
+        return _RowsRegion(rows_start, rows_end, [])
+
+    @staticmethod
+    def _patch_sheet_file(
+        sheet_path: str | os.PathLike[str], last_row: int, last_col: int
+    ) -> None:
+        dimension_patched = False
+        with open(sheet_path, "r+b") as stream:
+            for record, _ in iter_records_stream(stream):
+                if (
+                    record.record_id == 0x98
+                    and record.length >= 36
+                    and not dimension_patched
+                ):
+                    stream.seek(record.data_start + 24)
+                    stream.write(struct.pack("<i", last_row))
+                    stream.seek(record.data_start + 32)
+                    stream.write(struct.pack("<i", last_col))
+                    stream.seek(record.data_end)
+                    dimension_patched = True
+                elif record.record_id == 0xA1 and record.length >= 16:
+                    stream.seek(record.data_start + 4)
+                    stream.write(struct.pack("<i", last_row))
+                    stream.seek(record.data_start + 12)
+                    stream.write(struct.pack("<i", last_col))
+                    stream.seek(record.data_end)
 
     def _date_to_serial(self, value: _datetime.date | _datetime.datetime) -> float:
         if isinstance(value, _datetime.datetime):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from typing import BinaryIO
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,59 @@ def iter_records(data: bytes):
                 f"expected {length} bytes, only {len(data) - data_start} available"
             )
         yield Biff12Record(header_start, data_start, data_end, record_id, length)
+        offset = data_end
+
+
+def _read_vlq_stream(stream: BinaryIO, offset: int) -> tuple[int | None, int]:
+    """Read one BIFF12 variable-length integer from a binary stream."""
+
+    value = 0
+    shift = 0
+    position = offset
+    first = stream.read(1)
+    if not first:
+        return None, position
+    while True:
+        byte = first[0]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if byte & 0x80 == 0:
+            return value, position
+        shift += 7
+        if shift > 63:
+            raise ValueError("BIFF12 variable-length integer is too long")
+        first = stream.read(1)
+        if not first:
+            raise ValueError("Truncated BIFF12 variable-length integer")
+
+
+def iter_records_stream(stream: BinaryIO):
+    """Yield BIFF12 records from a seekable binary stream.
+
+    The record payload is yielded as the second item.  Only one record is
+    materialised at a time, while offsets remain relative to the stream.
+    """
+
+    offset = 0
+    while True:
+        header_start = offset
+        record_id, offset = _read_vlq_stream(stream, offset)
+        if record_id is None:
+            return
+        length, data_start = _read_vlq_stream(stream, offset)
+        if length is None:
+            raise ValueError("Truncated BIFF12 record length")
+        payload = stream.read(length)
+        if len(payload) != length:
+            raise ValueError(
+                f"Truncated BIFF12 record 0x{record_id:x}: "
+                f"expected {length} bytes, only {len(payload)} available"
+            )
+        data_end = data_start + length
+        yield (
+            Biff12Record(header_start, data_start, data_end, record_id, length),
+            payload,
+        )
         offset = data_end
 
 

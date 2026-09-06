@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as _datetime
 import math
+import mmap
 import numbers
 import os
 import re
@@ -12,15 +13,19 @@ from typing import Any, Iterable, Literal, Sequence
 from xml.parsers import expat
 
 from .updater_utils import (
+    DiskStringIndex,
     ZipPackage,
     column_index_to_letter,
     column_letter_to_index,
+    copy_file_range,
+    copy_stream,
     escape_xml_text,
     local_xml_name,
     materialize_rows,
     parse_relationships_xml,
     parse_shared_strings_xml,
     replace_or_add_xml_attribute,
+    rewrite_shared_strings_xml,
     resolve_zip_target,
     strip_invalid_xml_characters,
     trim_trailing_empty_rows,
@@ -59,11 +64,12 @@ def _date_like_format(format_code: str) -> bool:
 
 
 class XlsxUpdater:
-    """Replace the data region of sheets in an existing XLSX file.
+    """Replace the data region of sheets in an existing XLSX or XLSM file.
 
     The workbook, styles, drawings and all unrelated ZIP members are kept in
     place.  Only the selected worksheet XML, shared strings and pivot-cache
-    metadata are changed.
+    metadata are changed.  Macro parts in an XLSM package are copied as
+    opaque ZIP members and are never parsed or rewritten.
     """
 
     def __init__(self, path: str | os.PathLike[str]):
@@ -83,6 +89,7 @@ class XlsxUpdater:
         self._shared_strings_prefix = ""
         self._shared_strings_dirty = False
         self._use_shared_strings = False
+        self._stream_shared_strings: DiskStringIndex | None = None
 
     def get_sheet_names(self) -> list[str]:
         """Return worksheet names in workbook order."""
@@ -111,6 +118,15 @@ class XlsxUpdater:
             sheet_path = self._sheets[sheet_name]
         except KeyError as exc:
             raise KeyError(f"Worksheet not found: {sheet_name}") from exc
+
+        if self._stream_shared_strings is not None:
+            self.replace_sheet_data_stream(
+                sheet_name,
+                rows,
+                headers=headers,
+                style_fallback=style_fallback,
+            )
+            return
 
         materialized = trim_trailing_empty_rows(materialize_rows(rows))
         header_values = list(headers) if headers is not None else None
@@ -183,6 +199,186 @@ class XlsxUpdater:
         self._commit_shared_strings()
         self._patch_pivot_metadata(sheet_name, len(materialized), dimension_ref)
 
+    def replace_sheet_data_stream(
+        self,
+        sheet_name: str,
+        rows: Iterable[Sequence[Any]],
+        *,
+        headers: Sequence[str] | None = None,
+        style_fallback: StyleFallback = "inherit",
+    ) -> None:
+        """Replace worksheet data atomically while streaming rows.
+
+        The package and disk-backed shared-string index are committed only
+        after the one-pass row source and all metadata updates succeed.  A
+        failure therefore leaves this updater reusable for a later attempt.
+        """
+
+        if style_fallback not in ("inherit", "general"):
+            raise ValueError("style_fallback must be 'inherit' or 'general'")
+        if sheet_name not in self._sheets:
+            raise KeyError(f"Worksheet not found: {sheet_name}")
+
+        self._ensure_stream_shared_strings()
+        store = self._stream_shared_strings
+        self._package.begin_transaction()
+        try:
+            if store is not None:
+                store.begin_transaction()
+            self._replace_sheet_data_stream_impl(
+                sheet_name,
+                rows,
+                headers=headers,
+                style_fallback=style_fallback,
+            )
+            self._package.commit_transaction()
+            if store is not None:
+                store.commit_transaction()
+        except BaseException:
+            if store is not None:
+                store.rollback_transaction()
+            self._package.rollback_transaction()
+            raise
+
+    def _replace_sheet_data_stream_impl(
+        self,
+        sheet_name: str,
+        rows: Iterable[Sequence[Any]],
+        *,
+        headers: Sequence[str] | None = None,
+        style_fallback: StyleFallback = "inherit",
+    ) -> None:
+        """Replace worksheet data while streaming rows through temporary files.
+
+        The input iterable is consumed once.  Only the current row and bounded
+        I/O buffers are kept in memory; the final workbook is written by
+        :meth:`save` without calling :meth:`to_bytes`.
+        """
+
+        if style_fallback not in ("inherit", "general"):
+            raise ValueError("style_fallback must be 'inherit' or 'general'")
+        try:
+            sheet_path = self._sheets[sheet_name]
+        except KeyError as exc:
+            raise KeyError(f"Worksheet not found: {sheet_name}") from exc
+
+        header_values = list(headers) if headers is not None else None
+        original_sheet = self._package.temporary_path(suffix=".xml")
+        with self._package.open_entry(sheet_path) as source, original_sheet.open("wb") as target:
+            copy_stream(source, target)
+
+        self._ensure_stream_shared_strings()
+        with original_sheet.open("rb") as stream, mmap.mmap(
+            stream.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mapped:
+            header_styles, data_styles = self._collect_styles_stream(
+                mapped, headers_provided=headers is not None
+            )
+            if self._stream_shared_strings is not None:
+                self._stream_shared_strings.total_count = max(
+                    0,
+                    self._stream_shared_strings.total_count
+                    - self._shared_string_ref_count_stream(mapped),
+                )
+                self._stream_shared_strings.dirty = True
+            date_style = self._find_date_style_index() if style_fallback == "inherit" else None
+            sheet_data_match = re.search(
+                rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?sheetData\b", mapped
+            )
+            worksheet_prefix = (
+                (sheet_data_match.group("prefix") or b"").decode("ascii")
+                if sheet_data_match
+                else ""
+            )
+
+        rows_file = self._package.temporary_path(suffix=".rows")
+        width = len(header_values) if header_values is not None else 0
+        data_rows_seen = 0
+        kept_data_rows = 0
+        last_kept_end = 0
+        pending_empty_width = 0
+
+        updated_sheet = None
+        try:
+            with rows_file.open("wb") as output:
+                next_row = 1
+                if header_values is not None:
+                    cells = [
+                        self._value_cell(
+                            value,
+                            column,
+                            next_row,
+                            header_styles,
+                            data_styles,
+                            date_style,
+                            style_fallback,
+                            header=True,
+                            prefix=worksheet_prefix,
+                        )
+                        for column, value in enumerate(header_values)
+                    ]
+                    header_bytes = self._row_xml(next_row, cells, worksheet_prefix).encode("utf-8")
+                    output.write(header_bytes)
+                    last_kept_end = len(header_bytes)
+                    next_row += 1
+
+                for source_row in rows:
+                    if isinstance(source_row, (str, bytes, bytearray)):
+                        raise TypeError("Each row must be a sequence of cells, not text")
+                    try:
+                        row = list(source_row)
+                    except TypeError as exc:
+                        raise TypeError("Each row must be an iterable of cells") from exc
+
+                    cells = [
+                        self._value_cell(
+                            value,
+                            column,
+                            next_row,
+                            header_styles,
+                            data_styles,
+                            date_style,
+                            style_fallback,
+                            header=False,
+                            prefix=worksheet_prefix,
+                        )
+                        for column, value in enumerate(row)
+                    ]
+                    row_bytes = self._row_xml(next_row, cells, worksheet_prefix).encode("utf-8")
+                    output.write(row_bytes)
+                    data_rows_seen += 1
+                    next_row += 1
+
+                    if all(cell is None for cell in row):
+                        pending_empty_width = max(pending_empty_width, len(row))
+                    else:
+                        width = max(width, pending_empty_width, len(row))
+                        pending_empty_width = 0
+                        kept_data_rows = data_rows_seen
+                        last_kept_end = output.tell()
+
+                output.truncate(last_kept_end)
+
+            total_rows = kept_data_rows + (1 if header_values is not None else 0)
+            last_col = width - 1
+            dimension_ref = self._dimension_ref(total_rows, last_col)
+            updated_sheet = self._package.temporary_path(suffix=".xml")
+            self._patch_sheet_file(
+                original_sheet,
+                rows_file,
+                updated_sheet,
+                dimension_ref,
+            )
+            self._package.set_file(sheet_path, updated_sheet)
+            self._commit_stream_shared_strings()
+            self._patch_pivot_metadata(sheet_name, kept_data_rows, dimension_ref)
+        finally:
+            for temporary_path in (original_sheet, rows_file):
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+
     def save(self, output_path: str | os.PathLike[str] | None = None) -> None:
         """Save to a new path or atomically replace the input file."""
 
@@ -241,6 +437,172 @@ class XlsxUpdater:
         parser.StartElementHandler = start_element
         parser.Parse(self._package.get("xl/workbook.xml"), True)
         return date_1904
+
+    def _collect_styles_stream(
+        self, sheet_data, *, headers_provided: bool
+    ) -> tuple[dict[int, int], dict[int, int]]:
+        """Collect dominant styles from an mmap without copying the sheet."""
+
+        header_counts: dict[int, dict[int, int]] = {}
+        data_counts: dict[int, dict[int, int]] = {}
+        current_row: int | None = None
+        current_column = 0
+        row_sequence = 0
+        parser = expat.ParserCreate()
+
+        def start_element(name: str, attrs: dict[str, str]) -> None:
+            nonlocal current_row, current_column, row_sequence
+            local = local_xml_name(name)
+            if local == "row":
+                row_value = _xml_attribute(attrs, "r")
+                if row_value:
+                    current_row = int(row_value)
+                    row_sequence = current_row
+                else:
+                    row_sequence += 1
+                    current_row = row_sequence
+                current_column = 0
+            elif local == "c" and current_row is not None:
+                style_value = _xml_attribute(attrs, "s")
+                reference = _xml_attribute(attrs, "r")
+                column = (
+                    column_letter_to_index(reference) if reference else current_column
+                )
+                current_column = column + 1
+                if style_value:
+                    style = int(style_value)
+                    if style > 0:
+                        target = (
+                            header_counts
+                            if headers_provided and current_row == 1
+                            else data_counts
+                        )
+                        counts = target.setdefault(column, {})
+                        counts[style] = counts.get(style, 0) + 1
+
+        def end_element(name: str) -> None:
+            nonlocal current_row, current_column
+            if local_xml_name(name) == "row":
+                current_row = None
+                current_column = 0
+
+        parser.StartElementHandler = start_element
+        parser.EndElementHandler = end_element
+        for offset in range(0, len(sheet_data), 64 * 1024):
+            parser.Parse(sheet_data[offset : offset + 64 * 1024], False)
+        parser.Parse(b"", True)
+
+        def dominant(counts: dict[int, dict[int, int]]) -> dict[int, int]:
+            return {
+                column: max(styles.items(), key=lambda item: (item[1], -item[0]))[0]
+                for column, styles in counts.items()
+            }
+
+        return dominant(header_counts), dominant(data_counts)
+
+    @staticmethod
+    def _shared_string_ref_count_stream(sheet_data) -> int:
+        count = 0
+        parser = expat.ParserCreate()
+
+        def start_element(name: str, attrs: dict[str, str]) -> None:
+            nonlocal count
+            if local_xml_name(name) == "c" and _xml_attribute(attrs, "t") == "s":
+                count += 1
+
+        parser.StartElementHandler = start_element
+        for offset in range(0, len(sheet_data), 64 * 1024):
+            parser.Parse(sheet_data[offset : offset + 64 * 1024], False)
+        parser.Parse(b"", True)
+        return count
+
+    def _ensure_stream_shared_strings(self) -> None:
+        if self._stream_shared_strings is not None:
+            self._use_shared_strings = True
+            return
+        if not self._package.has("xl/sharedStrings.xml"):
+            self._use_shared_strings = False
+            return
+
+        store = DiskStringIndex(self._package.temporary_directory)
+        total_count: int | None = None
+        in_shared_item = False
+        in_text = False
+        text_parts: list[str] = []
+        values_count = 0
+        parser = expat.ParserCreate()
+
+        def start_element(name: str, attrs: dict[str, str]) -> None:
+            nonlocal total_count, in_shared_item, in_text, text_parts
+            local = local_xml_name(name)
+            if local == "sst":
+                count_value = _xml_attribute(attrs, "count")
+                total_count = int(count_value) if count_value else None
+            elif local == "si":
+                in_shared_item = True
+                text_parts = []
+            elif local == "t" and in_shared_item:
+                in_text = True
+
+        def end_element(name: str) -> None:
+            nonlocal in_shared_item, in_text, values_count
+            local = local_xml_name(name)
+            if local == "t":
+                in_text = False
+            elif local == "si" and in_shared_item:
+                store.add_existing("".join(text_parts), values_count)
+                values_count += 1
+                in_shared_item = False
+
+        def character_data(data: str) -> None:
+            if in_shared_item and in_text:
+                text_parts.append(data)
+
+        parser.StartElementHandler = start_element
+        parser.EndElementHandler = end_element
+        parser.CharacterDataHandler = character_data
+        with self._package.open_entry("xl/sharedStrings.xml") as source:
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                parser.Parse(chunk, False)
+        parser.Parse(b"", True)
+        store.total_count = total_count if total_count is not None else values_count
+        self._stream_shared_strings = store
+        self._use_shared_strings = True
+
+    def _commit_stream_shared_strings(self) -> None:
+        store = self._stream_shared_strings
+        if store is None or not store.dirty:
+            return
+
+        source_path = self._package.temporary_path(suffix=".xml")
+        with self._package.open_entry("xl/sharedStrings.xml") as source, source_path.open("wb") as target:
+            copy_stream(source, target)
+        output_path = self._package.temporary_path(suffix=".xml")
+        output_staged = False
+        try:
+            rewrite_shared_strings_xml(
+                source_path,
+                output_path,
+                store.pending_values(),
+                total_count=store.total_count,
+                unique_count=store.unique_count,
+            )
+            self._package.set_file("xl/sharedStrings.xml", output_path)
+            output_staged = True
+            store.clear_pending()
+        finally:
+            try:
+                source_path.unlink()
+            except FileNotFoundError:
+                pass
+            if not output_staged:
+                try:
+                    output_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _ensure_shared_strings_loaded(self) -> None:
         if self._shared_strings_loaded:
@@ -304,6 +666,8 @@ class XlsxUpdater:
         self._shared_strings_dirty = False
 
     def _shared_string_index(self, value: str) -> int:
+        if self._stream_shared_strings is not None:
+            return self._stream_shared_strings.get_or_add(value)
         index = self._shared_string_indices.get(value)
         if index is None:
             index = len(self._shared_strings_values)
@@ -610,6 +974,115 @@ class XlsxUpdater:
             )
         return sheet_xml
 
+    @staticmethod
+    def _patch_sheet_file(
+        original_path: str | os.PathLike[str],
+        rows_path: str | os.PathLike[str],
+        output_path: str | os.PathLike[str],
+        dimension_ref: str,
+    ) -> None:
+        """Patch one worksheet using file-backed byte ranges.
+
+        The replacements intentionally mirror :meth:`_patch_sheet_xml`: all
+        bytes outside the data and range attributes are copied unchanged.
+        """
+
+        with open(original_path, "rb") as source_stream:
+            source_size = os.fstat(source_stream.fileno()).st_size
+            if source_size == 0:
+                raise ValueError("Worksheet XML is empty")
+            with mmap.mmap(source_stream.fileno(), 0, access=mmap.ACCESS_READ) as source:
+                sheet_data_pattern = re.compile(
+                    rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?sheetData\b(?P<attrs>[^>]*)/>",
+                    re.DOTALL,
+                )
+                empty_match = sheet_data_pattern.search(source)
+                rows_replacement: list[tuple[int, int, tuple[bytes, bool, bytes] | bytes]]
+                if empty_match:
+                    prefix = empty_match.group("prefix") or b""
+                    opening = b"<" + prefix + b"sheetData" + empty_match.group("attrs") + b">"
+                    closing = b"</" + prefix + b"sheetData>"
+                    rows_replacement = [
+                        (empty_match.start(), empty_match.end(), (opening, True, closing))
+                    ]
+                else:
+                    opening_match = re.search(
+                        rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?sheetData\b[^>]*>",
+                        source,
+                    )
+                    if not opening_match:
+                        raise ValueError("Worksheet sheetData element was not found")
+                    prefix = opening_match.group("prefix") or b""
+                    closing_match = re.compile(
+                        b"</" + re.escape(prefix) + rb"sheetData\s*>"
+                    ).search(source, opening_match.end())
+                    if not closing_match:
+                        raise ValueError("Worksheet sheetData closing element was not found")
+                    rows_replacement = [
+                        (opening_match.end(), closing_match.start(), (b"", True, b""))
+                    ]
+
+                replacements: list[tuple[int, int, bytes | tuple[bytes, bool, bytes]]] = list(
+                    rows_replacement
+                )
+                dimension_match = re.search(
+                    rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?dimension\b[^>]*>", source
+                )
+                if dimension_match:
+                    opening = dimension_match.group(0).decode("utf-8")
+                    replacements.append(
+                        (
+                            dimension_match.start(),
+                            dimension_match.end(),
+                            replace_or_add_xml_attribute(opening, "ref", dimension_ref).encode(
+                                "utf-8"
+                            ),
+                        )
+                    )
+                else:
+                    worksheet_match = re.search(
+                        rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?worksheet\b[^>]*>", source
+                    )
+                    if not worksheet_match:
+                        raise ValueError("Worksheet root element was not found")
+                    prefix = worksheet_match.group("prefix") or b""
+                    dimension = (
+                        b"<" + prefix + b"dimension ref=\"" + escape_xml_text(dimension_ref).encode("utf-8") + b"\"/>"
+                    )
+                    replacements.append((worksheet_match.end(), worksheet_match.end(), dimension))
+
+                auto_filter_match = re.search(
+                    rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?autoFilter\b[^>]*>", source
+                )
+                if auto_filter_match:
+                    opening = auto_filter_match.group(0).decode("utf-8")
+                    replacements.append(
+                        (
+                            auto_filter_match.start(),
+                            auto_filter_match.end(),
+                            replace_or_add_xml_attribute(opening, "ref", dimension_ref).encode(
+                                "utf-8"
+                            ),
+                        )
+                    )
+
+                replacements.sort(key=lambda item: (item[0], item[1]))
+                with open(output_path, "wb") as target:
+                    cursor = 0
+                    for start, end, replacement in replacements:
+                        if start < cursor:
+                            raise ValueError("Overlapping worksheet XML replacements")
+                        copy_file_range(original_path, target, cursor, start)
+                        if isinstance(replacement, tuple):
+                            target.write(replacement[0])
+                            with open(rows_path, "rb") as rows_stream:
+                                copy_stream(rows_stream, target)
+                            target.write(replacement[2])
+                        else:
+                            target.write(replacement)
+                        cursor = end
+                    copy_file_range(original_path, target, cursor, source_size)
+
     def _patch_pivot_metadata(
         self, sheet_name: str, record_count: int, dimension_ref: str
     ) -> None:
@@ -677,3 +1150,9 @@ class XlsxUpdater:
 
     def _package_names(self) -> list[str]:
         return self._package.names()
+
+
+# XLSM is the macro-enabled OOXML variant of XLSX.  Keep a named alias for
+# callers who want the input format to be explicit while sharing the exact
+# same implementation and macro-preservation behaviour.
+XlsmUpdater = XlsxUpdater

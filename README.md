@@ -1,6 +1,7 @@
-# Python XLSB Reader & Writer
+# Python XLSB/XLSX/XLSM Reader & Writer
 
-A Python library for reading and writing XLSB and XLSX files efficiently.
+A Python library for reading and writing XLSB and XLSX files efficiently, with
+existing-workbook updates for macro-enabled XLSM packages.
 
 ## Installation
 
@@ -124,7 +125,8 @@ The formatting works transparently on both `XlsxWriter` and `XlsbWriter`.
 
 ### Updating an Existing Workbook
 
-`XlsxUpdater` and `XlsbUpdater` replace the data region of an existing workbook
+`XlsxUpdater` (also for macro-enabled `.xlsm` files) and `XlsbUpdater` replace
+the data region of an existing workbook
 while keeping the workbook structure, styles, drawings and unrelated sheets.
 They are useful when a workbook contains pivot tables: the worksheet source
 range and pivot-cache refresh metadata are updated together.
@@ -146,7 +148,43 @@ updater.save("result.xlsx")       # use save() to replace the input atomically
 binary_updater = XlsbUpdater("template.xlsb")
 binary_updater.replace_sheet_data("Data", rows, headers=["Name", "Amount"])
 binary_updater.save("result.xlsb")
+
+# XLSM uses the same XML updater.  The VBA project is preserved byte-for-byte.
+macro_updater = XlsxUpdater("template.xlsm")
+macro_updater.replace_sheet_data("Data", rows, headers=["Name", "Amount"])
+macro_updater.save("result.xlsm")
 ```
+
+`XlsmUpdater` is an explicit alias of `XlsxUpdater` for `.xlsm` inputs.  The
+updater does not parse, execute or rewrite VBA; `xl/vbaProject.bin` and other
+unrelated macro parts are copied as opaque ZIP members.
+
+For a database cursor or another one-pass source, use the streaming variant.
+Rows are written through bounded-memory temporary files, so the complete
+result set is not kept in Python memory. Multiple sheets may be streamed on
+the same updater before `save()`:
+
+```python
+def rows_from_cursor(cursor):
+    while True:
+        row = cursor.fetchone()
+        if row is None:
+            break
+        yield list(row)
+
+updater = XlsxUpdater("template.xlsx")  # also accepts .xlsm; use XlsbUpdater for .xlsb
+updater.replace_sheet_data_stream(
+    "Data",
+    rows_from_cursor(cursor),
+    headers=["Name", "Amount"],
+)
+updater.save("result.xlsx")              # or result.xlsb
+```
+
+The streaming API requires `save()` for its memory-bounded write path.
+`to_bytes()` necessarily creates the complete archive in memory because it
+returns the complete file as `bytes`. The original `replace_sheet_data()` API
+is unchanged and remains available for in-memory inputs.
 
 Rows may be any iterable, including a generator. Only trailing rows consisting
 entirely of `None` are removed; blank rows in the middle are preserved. By
